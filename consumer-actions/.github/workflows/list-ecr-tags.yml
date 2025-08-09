@@ -1,0 +1,79 @@
+name: List ECR Tags
+on:
+  workflow_dispatch:
+    inputs:
+      services_csv:
+        description: "Comma-separated services (optional; if empty, use eks-config/repos/services.txt)"
+        required: false
+      aws_region:
+        description: "AWS region (e.g. eu-west-1)"
+        required: true
+      max_tags:
+        description: "How many recent tags per service"
+        required: false
+        default: "10"
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Clone eks-config
+        run: |
+          git clone --depth 1 "${{ secrets.EKS_CONFIG_GIT_URL }}" eks-config
+
+      - name: Resolve services + map and list tags
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          MAX_TAGS: ${{ inputs.max_tags }}
+        run: |
+          set -euo pipefail
+          # Services
+          if [ -n "${{ inputs.services_csv }}" ]; then
+            SCSV="${{ inputs.services_csv }}"
+          else
+            SCSV=$(grep -v '^\s*$' eks-config/repos/services.txt | tr '\n' ',' | sed 's/,$//')
+          fi
+          MAP=$(cat eks-config/repos/ecr-map.json)
+
+          echo '{}' > tags.json
+          IFS=',' read -r -a SVCS <<< "$SCSV"
+          for SVC in "${SVCS[@]}"; do
+            SVC="${SVC// /}"
+            REPO=$(jq -r --arg k "$SVC" '.[$k]' <<<"$MAP")
+            [ -n "$REPO" ] && [ "$REPO" != "null" ] || { echo "skip $SVC"; continue; }
+
+            # Newest first, limit MAX_TAGS, drop nulls
+            TAGS=$(aws ecr describe-images \
+              --repository-name "$REPO" \
+              --region "$AWS_REGION" \
+              --query "reverse(sort_by(imageDetails,& imagePushedAt))[:\`$MAX_TAGS\`].imageTags[]" \
+              --output json | jq 'map(select(. != null))')
+
+            jq --arg k "$SVC" --argjson v "$TAGS" '. + {($k): $v}' tags.json > tmp.json && mv tmp.json tags.json
+          done
+
+          # Summary
+          echo "## Available ECR tags (newest ${MAX_TAGS})" >> $GITHUB_STEP_SUMMARY
+          jq -r 'to_entries[] | "- **\(.key)**: \(.value | join(", "))"' tags.json >> $GITHUB_STEP_SUMMARY
+
+          # versions_json helper (most recent per service)
+          VJSON=$(jq -r 'to_entries | map({(.key): (if .value | length > 0 then .value[0] else "latest" end)}) | add' tags.json)
+          echo -e "\n---\n**Example versions_json for Create Ephemeral Env:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          echo "$VJSON" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: available-tags
+          path: tags.json
