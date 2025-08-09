@@ -1,0 +1,132 @@
+name: Create Ephemeral Env (reusable, ECR)
+
+on:
+  workflow_call:
+    inputs:
+      base_env:         { type: string, required: true, description: "env-uat | env-pt | env-sit | env-dev | env-stg" }
+      services_csv:     { type: string, required: false, description: "Comma-separated services; if empty, use eks-config/repos/services.txt" }
+      versions_json:    { type: string, required: true, description: 'JSON: {"svc":"tag"} (use "latest" to auto-resolve from ECR)' }
+      ttl_minutes:      { type: string, required: true, default: "120" }
+      eks_cluster_name: { type: string, required: true }
+      aws_region:       { type: string, required: true }
+      ecr_registry:     { type: string, required: true, description: "e.g. 123456789012.dkr.ecr.eu-west-1.amazonaws.com" }
+      ecr_repo_map:     { type: string, required: false, description: 'JSON map override; if empty, use eks-config/repos/ecr-map.json or ECR_REPO_PREFIX' }
+      eks_config_git_branch: { type: string, required: false, default: "master" }
+      resolve_latest:   { type: boolean, required: false, default: true }
+      sync_ecr_secret:  { type: boolean, required: false, default: false }
+      source_namespace_for_ecr_secret: { type: string, required: false, default: "env-uat" }
+      patch_default_sa: { type: boolean, required: false, default: true }
+    secrets:
+      AWS_ROLE_TO_ASSUME: { required: true }
+      EKS_CONFIG_GIT_URL: { required: true }
+      MS_TEAMS_WEBHOOK:   { required: true }
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/example/aat26/infra/ek-multiple-tools:v13b-amd64
+    permissions: { id-token: write, contents: read, actions: read }
+    env: { WORKDIR: eks-config }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Clone eks-config (manifests)
+        run: |
+          git clone --depth 1 "${{ secrets.EKS_CONFIG_GIT_URL }}" "$WORKDIR"
+          cd "$WORKDIR" && git checkout "${{ inputs.eks_config_git_branch }}"
+
+      - name: Resolve services list and repo map
+        id: resolve
+        run: |
+          set -euo pipefail
+          # Services CSV
+          if [ -n "${{ inputs.services_csv }}" ]; then
+            SCSV="${{ inputs.services_csv }}"
+          else
+            SCSV=$(grep -v '^\s*$' "$WORKDIR/repos/services.txt" | tr '\n' ',' | sed 's/,$//')
+          fi
+          echo "services_csv=$SCSV" >> $GITHUB_OUTPUT
+
+          # Repo map JSON
+          if [ -n "${{ inputs.ecr_repo_map }}" ]; then
+            MAP='${{ inputs.ecr_repo_map }}'
+          elif [ -f "$WORKDIR/repos/ecr-map.json" ]; then
+            MAP=$(cat "$WORKDIR/repos/ecr-map.json")
+          elif [ -n "${ECR_REPO_PREFIX:-}" ]; then
+            MAP=$(python - <<'PY' "$SCSV"
+import json, sys, os
+services = sys.argv[1].split(',')
+prefix = os.environ.get('ECR_REPO_PREFIX','').rstrip('/')
+m = { s.strip(): f"{prefix}/{s.strip()}" for s in services if s.strip() }
+print(json.dumps(m))
+PY
+)
+          else
+            echo "ERROR: No ecr_repo_map, no $WORKDIR/repos/ecr-map.json, and ECR_REPO_PREFIX not set." >&2
+            exit 1
+          fi
+          echo "ecr_repo_map=$MAP" >> $GITHUB_OUTPUT
+
+      - name: Configure kubeconfig for EKS
+        env: { AWS_REGION: ${{ inputs.aws_region }} }
+        run: |
+          bash ci/aws_kubeconfig.sh "${{ inputs.eks_cluster_name }}" "${{ inputs.aws_region }}"
+          kubectl cluster-info
+
+      - name: Bootstrap dynamic namespace
+        id: scaffold
+        run: |
+          UID=$(bash ci/generate_id.sh "${{ inputs.base_env }}")
+          echo "uid=$UID" >> $GITHUB_OUTPUT
+          bash ci/create_ns.sh "$UID"
+          bash ci/create_sa.sh "$UID" "vault-auth"
+          bash ci/create_crb.sh "$UID" "vault-auth"
+
+      - name: Sync/refresh ECR pull secret (optional)
+        if: ${{ inputs.sync_ecr_secret }}
+        env: { AWS_REGION: ${{ inputs.aws_region }} }
+        run: |
+          PATCH_DEFAULT_SA="${{ inputs.patch_default_sa }}" bash ci/sync_ecr_secret.sh \
+            "${{ inputs.source_namespace_for_ecr_secret }}" \
+            "${{ steps.scaffold.outputs.uid }}" \
+            "${{ inputs.ecr_registry }}"
+
+      - name: Prepare manifests (ECR images + tags)
+        env:
+          ECR_REGISTRY: ${{ inputs.ecr_registry }}
+        run: |
+          EXTRA_FLAG=""
+          if [[ "${{ inputs.resolve_latest }}" == "true" ]]; then EXTRA_FLAG="--resolve-latest"; fi
+          bash ci/prepare_manifests.sh \
+            --workdir "$WORKDIR" \
+            --base-env "${{ inputs.base_env }}" \
+            --uid "${{ steps.scaffold.outputs.uid }}" \
+            --services "${{ steps.resolve.outputs.services_csv }}" \
+            --versions '${{ inputs.versions_json }}' \
+            --ecr-registry "$ECR_REGISTRY" \
+            --ecr-repo-map '${{ steps.resolve.outputs.ecr_repo_map }}' \
+            $EXTRA_FLAG
+
+      - name: Apply manifests
+        run: |
+          bash ci/apply_manifests.sh "ephemeral-ws-${{ steps.scaffold.outputs.uid }}" "${{ steps.scaffold.outputs.uid }}"
+
+      - name: Schedule self-destruct (CronJob)
+        run: |
+          RUN_AT=$(date -u -d "+${{ inputs.ttl_minutes }} minutes" "+%M %H %d %m *")
+          sed -e "s/{{UNIQUE_ID}}/${{ steps.scaffold.outputs.uid }}/g" \
+              -e "s/{{CRON_SCHEDULE}}/${RUN_AT}/g" \
+            "$WORKDIR/jobs/dynamic-env-teardown-job.yaml" | kubectl apply -f -
+
+      - name: Notify Teams
+        if: always()
+        env: { TEAMS_WEBHOOK: ${{ secrets.MS_TEAMS_WEBHOOK }} }
+        run: |
+          bash ci/notify_teams.sh "$TEAMS_WEBHOOK" "${{ steps.scaffold.outputs.uid }}" "${{ inputs.ttl_minutes }}"
