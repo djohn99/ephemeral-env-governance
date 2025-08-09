@@ -27,7 +27,8 @@ jobs:
     container:
       image: quay.io/example/aat26/infra/ek-multiple-tools:v13b-amd64
     permissions: { id-token: write, contents: read, actions: read }
-    env: { WORKDIR: eks-config }
+    env: 
+      WORKDIR: eks-config
     steps:
       - uses: actions/checkout@v4
 
@@ -92,7 +93,8 @@ jobs:
 
       - name: Sync/refresh ECR pull secret (optional)
         if: ${{ inputs.sync_ecr_secret }}
-        env: { AWS_REGION: ${{ inputs.aws_region }} }
+        env: 
+          AWS_REGION: ${{ inputs.aws_region }}
         run: |
           PATCH_DEFAULT_SA="${{ inputs.patch_default_sa }}" bash ci/sync_ecr_secret.sh \
             "${{ inputs.source_namespace_for_ecr_secret }}" \
@@ -128,6 +130,7 @@ jobs:
 
       - name: Notify Teams
         if: always()
-        env: { TEAMS_WEBHOOK: ${{ secrets.MS_TEAMS_WEBHOOK }} }
+        env: 
+          TEAMS_WEBHOOK: ${{ secrets.MS_TEAMS_WEBHOOK }}
         run: |
           bash ci/notify_teams.sh "$TEAMS_WEBHOOK" "${{ steps.scaffold.outputs.uid }}" "${{ inputs.ttl_minutes }}"
