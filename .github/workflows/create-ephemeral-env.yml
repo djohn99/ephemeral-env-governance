@@ -75,7 +75,8 @@ jobs:
           echo "ecr_repo_map=$MAP" >> $GITHUB_OUTPUT
 
       - name: Configure kubeconfig for EKS
-        env: { AWS_REGION: ${{ inputs.aws_region }} }
+        env: 
+          AWS_REGION: ${{ inputs.aws_region }}
         run: |
           bash ci/aws_kubeconfig.sh "${{ inputs.eks_cluster_name }}" "${{ inputs.aws_region }}"
           kubectl cluster-info
