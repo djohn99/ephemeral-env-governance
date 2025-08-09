@@ -61,13 +61,13 @@ jobs:
             MAP=$(cat "$WORKDIR/repos/ecr-map.json")
           elif [ -n "${ECR_REPO_PREFIX:-}" ]; then
             MAP=$(python - <<'PY' "$SCSV"
-import json, sys, os
-services = sys.argv[1].split(',')
-prefix = os.environ.get('ECR_REPO_PREFIX','').rstrip('/')
-m = { s.strip(): f"{prefix}/{s.strip()}" for s in services if s.strip() }
-print(json.dumps(m))
-PY
-)
+            import json, sys, os
+            services = sys.argv[1].split(',')
+            prefix = os.environ.get('ECR_REPO_PREFIX','').rstrip('/')
+            m = { s.strip(): f"{prefix}/{s.strip()}" for s in services if s.strip() }
+            print(json.dumps(m))
+            PY
+            )
           else
             echo "ERROR: No ecr_repo_map, no $WORKDIR/repos/ecr-map.json, and ECR_REPO_PREFIX not set." >&2
             exit 1
